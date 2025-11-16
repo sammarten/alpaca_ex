@@ -10,26 +10,31 @@ defmodule AlpacaEx.StreamTest do
     end
   end
 
-  setup do
-    # Configure test credentials
-    Application.put_env(:alpaca_ex, :api_key, "test-api-key")
-    Application.put_env(:alpaca_ex, :api_secret, "test-api-secret")
-    Application.put_env(:alpaca_ex, :ws_url, "wss://stream.data.alpaca.markets/v2/iex")
+  setup tags do
+    # Only configure credentials for integration tests
+    if tags[:integration] do
+      Application.put_env(:alpaca_ex, :api_key, "test-api-key")
+      Application.put_env(:alpaca_ex, :api_secret, "test-api-secret")
+      Application.put_env(:alpaca_ex, :ws_url, "wss://stream.data.alpaca.markets/v2/iex")
 
-    on_exit(fn ->
-      Application.delete_env(:alpaca_ex, :api_key)
-      Application.delete_env(:alpaca_ex, :api_secret)
-      Application.delete_env(:alpaca_ex, :ws_url)
-    end)
+      on_exit(fn ->
+        Application.delete_env(:alpaca_ex, :api_key)
+        Application.delete_env(:alpaca_ex, :api_secret)
+        Application.delete_env(:alpaca_ex, :ws_url)
+      end)
+    end
 
     :ok
   end
 
   describe "start_link/1" do
     test "requires callback_module option" do
-      assert_raise KeyError, fn ->
-        AlpacaEx.Stream.start_link([])
-      end
+      # Trap exits so we can catch the error from the GenServer process
+      Process.flag(:trap_exit, true)
+
+      # When init/1 raises, the GenServer crashes and sends an EXIT signal
+      assert {:error, {%KeyError{key: :callback_module}, _stacktrace}} =
+               AlpacaEx.Stream.start_link([])
     end
 
     # Note: Full integration test would require WebSocket connection
@@ -50,8 +55,9 @@ defmodule AlpacaEx.StreamTest do
     end
   end
 
-  @tag :integration
   describe "integration tests" do
+    @describetag :integration
+
     test "connects and receives data" do
       # Start stream with test callback
       {:ok, pid} =
