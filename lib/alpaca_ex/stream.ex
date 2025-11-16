@@ -71,6 +71,7 @@ defmodule AlpacaEx.Stream do
   - `:callback_module` (required) - Module implementing `handle_message/2`
   - `:callback_state` - Initial state passed to callbacks (default: `nil`)
   - `:name` - GenServer name for registration
+  - `:skip_connect` - Skip automatic connection on startup (default: `false`, useful for testing)
 
   ## Examples
 
@@ -166,6 +167,7 @@ defmodule AlpacaEx.Stream do
   def init(opts) do
     callback_module = Keyword.fetch!(opts, :callback_module)
     callback_state = Keyword.get(opts, :callback_state)
+    skip_connect = Keyword.get(opts, :skip_connect, false)
 
     state = %{
       callback_module: callback_module,
@@ -176,8 +178,12 @@ defmodule AlpacaEx.Stream do
       reconnect_attempt: 0
     }
 
-    # Connect immediately
-    {:ok, state, {:continue, :connect}}
+    # Connect immediately unless skip_connect is true
+    if skip_connect do
+      {:ok, state}
+    else
+      {:ok, state, {:continue, :connect}}
+    end
   end
 
   @impl true
@@ -278,7 +284,10 @@ defmodule AlpacaEx.Stream do
   defp connect(state) do
     ws_url = AlpacaEx.Config.ws_url()
 
-    case WebSockex.start_link(ws_url, __MODULE__, state, handle_initial_conn_failure: true) do
+    # Add GenServer PID to state so WebSocket callbacks can send messages back
+    ws_state = Map.put(state, :genserver_pid, self())
+
+    case WebSockex.start_link(ws_url, __MODULE__, ws_state, handle_initial_conn_failure: true) do
       {:ok, pid} ->
         # Monitor the WebSocket process
         Process.monitor(pid)
@@ -541,7 +550,7 @@ defmodule AlpacaEx.Stream do
   end
 
   defp parse_decimal(value) when is_number(value) do
-    Decimal.from_float(value)
+    value |> to_string() |> Decimal.new()
   end
 
   # WebSockex Callbacks
@@ -549,7 +558,8 @@ defmodule AlpacaEx.Stream do
   # We don't declare @behaviour WebSockex to avoid conflicts with GenServer callbacks
 
   def handle_frame({:text, msg}, state) do
-    send(self(), {:websocket, self(), {:text, msg}})
+    # Send message to the GenServer process, not to self (WebSocket process)
+    send(state.genserver_pid, {:websocket, self(), {:text, msg}})
     {:ok, state}
   end
 
@@ -581,4 +591,96 @@ defmodule AlpacaEx.Stream do
     Logger.info("Process terminating: #{inspect(reason)}")
     :ok
   end
+end
+
+defmodule AlpacaEx.Stream.LogHandler do
+  @moduledoc """
+  A simple logging callback handler for AlpacaEx.Stream.
+
+  This module logs all incoming messages to the console, which is useful
+  for testing and debugging. It implements the callback interface required
+  by `AlpacaEx.Stream`.
+
+  ## Usage
+
+      {:ok, pid} = AlpacaEx.Stream.start_link(
+        callback_module: AlpacaEx.Stream.LogHandler,
+        name: MyStream
+      )
+
+  """
+
+  require Logger
+
+  @doc """
+  Handles incoming messages by logging them.
+  """
+  def handle_message(%{type: :connection, status: status} = msg, state) do
+    case status do
+      :connected ->
+        Logger.info("✓ Connected to Alpaca stream")
+
+      :subscribed ->
+        Logger.info("✓ Subscribed: #{inspect(msg.subscriptions)}")
+
+      :disconnected ->
+        Logger.warning("⚠ Disconnected (attempt #{msg.attempt})")
+
+      _ ->
+        Logger.debug("Connection: #{inspect(msg)}")
+    end
+
+    {:ok, state}
+  end
+
+  def handle_message(%{type: :trade} = trade, state) do
+    count = (state[:count] || 0) + 1
+    time = format_time(trade.timestamp)
+
+    Logger.info(
+      "[#{count}] Trade: #{trade.symbol} @ $#{trade.price} x #{trade.size} (#{time})"
+    )
+
+    {:ok, Map.put(state || %{}, :count, count)}
+  end
+
+  def handle_message(%{type: :quote} = quote, state) do
+    count = (state[:count] || 0) + 1
+    time = format_time(quote.timestamp)
+
+    Logger.info(
+      "[#{count}] Quote: #{quote.symbol} - Bid: $#{quote.bid_price} / Ask: $#{quote.ask_price} (#{time})"
+    )
+
+    {:ok, Map.put(state || %{}, :count, count)}
+  end
+
+  def handle_message(%{type: :bar} = bar, state) do
+    count = (state[:count] || 0) + 1
+    time = format_time(bar.timestamp)
+
+    Logger.info(
+      "[#{count}] Bar: #{bar.symbol} - O:$#{bar.open} H:$#{bar.high} L:$#{bar.low} C:$#{bar.close} V:#{bar.volume} (#{time})"
+    )
+
+    {:ok, Map.put(state || %{}, :count, count)}
+  end
+
+  def handle_message(%{type: :status} = status, state) do
+    Logger.info("Status: #{status.symbol} - #{status.status_code}: #{status.status_message}")
+    {:ok, state}
+  end
+
+  def handle_message(msg, state) do
+    Logger.debug("Unknown message: #{inspect(msg)}")
+    {:ok, state}
+  end
+
+  defp format_time(nil), do: "N/A"
+
+  defp format_time(%DateTime{} = dt) do
+    Calendar.strftime(dt, "%H:%M:%S")
+  end
+
+  defp format_time(_), do: "N/A"
 end
