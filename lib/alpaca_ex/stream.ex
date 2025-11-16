@@ -58,8 +58,6 @@ defmodule AlpacaEx.Stream do
   use GenServer
   require Logger
 
-  @behaviour WebSockex
-
   @max_backoff 60_000
   @initial_backoff 1_000
 
@@ -547,28 +545,40 @@ defmodule AlpacaEx.Stream do
   end
 
   # WebSockex Callbacks
+  # These callbacks are used when this module is passed to WebSockex.start_link/4
+  # We don't declare @behaviour WebSockex to avoid conflicts with GenServer callbacks
 
-  @impl WebSockex
   def handle_frame({:text, msg}, state) do
     send(self(), {:websocket, self(), {:text, msg}})
     {:ok, state}
   end
 
-  @impl WebSockex
   def handle_frame(_frame, state) do
     {:ok, state}
   end
 
-  @impl WebSockex
   def handle_disconnect(%{reason: reason}, state) do
     Logger.warning("WebSocket disconnected: #{inspect(reason)}")
     send(self(), {:websocket_disconnected, reason})
     {:ok, state}
   end
 
-  @impl WebSockex
+  def handle_connect(_conn, state) do
+    {:ok, state}
+  end
+
+  def handle_ping(:ping, state) do
+    {:reply, :pong, state}
+  end
+
+  def handle_pong(:pong, state) do
+    {:ok, state}
+  end
+
+  # This implements both GenServer.terminate/2 and is used by WebSockex.terminate/2
+  @impl true
   def terminate(reason, _state) do
-    Logger.info("WebSocket terminating: #{inspect(reason)}")
+    Logger.info("Process terminating: #{inspect(reason)}")
     :ok
   end
 end
