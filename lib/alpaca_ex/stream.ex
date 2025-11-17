@@ -55,10 +55,8 @@ defmodule AlpacaEx.Stream do
   connection is lost. All subscriptions will be restored after reconnection.
   """
 
-  use GenServer
+  use WebSockex
   require Logger
-
-  @behaviour WebSockex
 
   @max_backoff 60_000
   @initial_backoff 1_000
@@ -66,13 +64,13 @@ defmodule AlpacaEx.Stream do
   # Client API
 
   @doc """
-  Starts the stream GenServer.
+  Starts the stream WebSocket client.
 
   ## Options
 
   - `:callback_module` (required) - Module implementing `handle_message/2`
   - `:callback_state` - Initial state passed to callbacks (default: `nil`)
-  - `:name` - GenServer name for registration
+  - `:name` - Process name for registration
 
   ## Examples
 
@@ -83,15 +81,30 @@ defmodule AlpacaEx.Stream do
       )
 
   """
-  @spec start_link(keyword()) :: GenServer.on_start()
+  @spec start_link(keyword()) :: {:ok, pid()} | {:error, term()}
   def start_link(opts) do
-    {name, opts} = Keyword.pop(opts, :name)
+    callback_module = Keyword.fetch!(opts, :callback_module)
+    callback_state = Keyword.get(opts, :callback_state)
+    name = Keyword.get(opts, :name)
 
-    if name do
-      GenServer.start_link(__MODULE__, opts, name: name)
-    else
-      GenServer.start_link(__MODULE__, opts)
-    end
+    state = %{
+      callback_module: callback_module,
+      callback_state: callback_state,
+      status: :connecting,
+      subscriptions: %{bars: [], quotes: [], trades: [], statuses: []},
+      reconnect_attempt: 0
+    }
+
+    ws_url = AlpacaEx.Config.ws_url()
+
+    websockex_opts =
+      if name do
+        [name: name, async: true]
+      else
+        [async: true]
+      end
+
+    WebSockex.start_link(ws_url, __MODULE__, state, websockex_opts)
   end
 
   @doc """
@@ -99,7 +112,7 @@ defmodule AlpacaEx.Stream do
 
   ## Parameters
 
-  - `pid` - Stream GenServer pid or name
+  - `pid` - Stream process pid or name
   - `subscriptions` - Map with subscription types:
     - `:bars` - List of symbols for bar updates
     - `:quotes` - List of symbols for quote updates
@@ -114,9 +127,9 @@ defmodule AlpacaEx.Stream do
       })
 
   """
-  @spec subscribe(GenServer.server(), map()) :: :ok
+  @spec subscribe(pid() | atom(), map()) :: :ok
   def subscribe(pid, subscriptions) when is_map(subscriptions) do
-    GenServer.call(pid, {:subscribe, subscriptions})
+    WebSockex.cast(pid, {:subscribe, subscriptions})
   end
 
   @doc """
@@ -127,187 +140,93 @@ defmodule AlpacaEx.Stream do
       AlpacaEx.Stream.unsubscribe(pid, %{bars: ["AAPL"]})
 
   """
-  @spec unsubscribe(GenServer.server(), map()) :: :ok
+  @spec unsubscribe(pid() | atom(), map()) :: :ok
   def unsubscribe(pid, subscriptions) when is_map(subscriptions) do
-    GenServer.call(pid, {:unsubscribe, subscriptions})
+    WebSockex.cast(pid, {:unsubscribe, subscriptions})
   end
 
-  @doc """
-  Gets the current connection status.
-
-  Returns one of: `:disconnected`, `:connecting`, `:connected`, `:authenticated`, `:subscribed`
-
-  ## Examples
-
-      AlpacaEx.Stream.status(pid)
-      #=> :subscribed
-
-  """
-  @spec status(GenServer.server()) :: atom()
-  def status(pid) do
-    GenServer.call(pid, :status)
-  end
-
-  @doc """
-  Gets current subscriptions.
-
-  ## Examples
-
-      AlpacaEx.Stream.subscriptions(pid)
-      #=> %{bars: ["AAPL"], quotes: ["AAPL", "TSLA"]}
-
-  """
-  @spec subscriptions(GenServer.server()) :: map()
-  def subscriptions(pid) do
-    GenServer.call(pid, :subscriptions)
-  end
-
-  # GenServer Callbacks
+  # WebSockex Callbacks
 
   @impl true
-  def init(opts) do
-    callback_module = Keyword.fetch!(opts, :callback_module)
-    callback_state = Keyword.get(opts, :callback_state)
-
-    state = %{
-      callback_module: callback_module,
-      callback_state: callback_state,
-      ws_pid: nil,
-      status: :disconnected,
-      subscriptions: %{bars: [], quotes: [], trades: [], statuses: []},
-      reconnect_attempt: 0
-    }
-
-    # Connect immediately
-    {:ok, state, {:continue, :connect}}
+  def handle_connect(_conn, state) do
+    Logger.debug("WebSocket connection established")
+    {:ok, state}
   end
 
   @impl true
-  def handle_continue(:connect, state) do
-    case connect(state) do
-      {:ok, ws_pid} ->
-        new_state = %{state | ws_pid: ws_pid, status: :connecting, reconnect_attempt: 0}
-        {:noreply, new_state}
-
-      {:error, reason} ->
-        Logger.error("Failed to connect: #{inspect(reason)}")
-        schedule_reconnect(state)
-        {:noreply, state}
-    end
+  def handle_frame({:text, message}, state) do
+    new_state = handle_websocket_message(message, state)
+    {:ok, new_state}
   end
 
   @impl true
-  def handle_call({:subscribe, new_subs}, _from, state) do
+  def handle_frame(_frame, state) do
+    {:ok, state}
+  end
+
+  @impl true
+  def handle_cast({:send_frame, json}, state) do
+    {:reply, {:text, json}, state}
+  end
+
+  @impl true
+  def handle_cast({:subscribe, new_subs}, state) do
     # Merge new subscriptions with existing ones
     updated_subs = merge_subscriptions(state.subscriptions, new_subs)
 
     # If we're authenticated, send subscribe message
     new_state =
       if state.status in [:authenticated, :subscribed] do
-        send_subscribe(state.ws_pid, new_subs)
+        send_subscribe(new_subs, state)
         %{state | subscriptions: updated_subs, status: :subscribed}
       else
         # Queue the subscriptions for when we connect
         %{state | subscriptions: updated_subs}
       end
 
-    {:reply, :ok, new_state}
+    {:ok, new_state}
   end
 
   @impl true
-  def handle_call({:unsubscribe, remove_subs}, _from, state) do
+  def handle_cast({:unsubscribe, remove_subs}, state) do
     # Remove subscriptions
     updated_subs = remove_subscriptions(state.subscriptions, remove_subs)
 
     # If we're authenticated, send unsubscribe message
     if state.status in [:authenticated, :subscribed] do
-      send_unsubscribe(state.ws_pid, remove_subs)
+      send_unsubscribe(remove_subs, state)
     end
 
-    {:reply, :ok, %{state | subscriptions: updated_subs}}
+    {:ok, %{state | subscriptions: updated_subs}}
   end
 
   @impl true
-  def handle_call(:status, _from, state) do
-    {:reply, state.status, state}
-  end
+  def handle_disconnect(%{reason: reason}, state) do
+    Logger.warning("WebSocket disconnected: #{inspect(reason)}")
 
-  @impl true
-  def handle_call(:subscriptions, _from, state) do
-    {:reply, state.subscriptions, state}
-  end
-
-  @impl true
-  def handle_info({:ssl_closed, _}, state) do
-    Logger.warning("SSL connection closed")
-    handle_disconnect(state)
-  end
-
-  @impl true
-  def handle_info(:reconnect, state) do
-    case connect(state) do
-      {:ok, ws_pid} ->
-        new_state = %{state | ws_pid: ws_pid, status: :connecting}
-        {:noreply, new_state}
-
-      {:error, reason} ->
-        Logger.error("Reconnection failed: #{inspect(reason)}")
-        schedule_reconnect(state)
-        {:noreply, state}
-    end
-  end
-
-  @impl true
-  def handle_info({:websocket, ws_pid, {:text, message}}, %{ws_pid: ws_pid} = state) do
-    new_state = handle_websocket_message(message, state)
-    {:noreply, new_state}
-  end
-
-  @impl true
-  def handle_info({:DOWN, _ref, :process, ws_pid, reason}, %{ws_pid: ws_pid} = state) do
-    Logger.warning("WebSocket process down: #{inspect(reason)}")
-    handle_disconnect(state)
-  end
-
-  @impl true
-  def handle_info(msg, state) do
-    Logger.debug("Unexpected message: #{inspect(msg)}")
-    {:noreply, state}
-  end
-
-  # Private Functions
-
-  defp connect(state) do
-    ws_url = AlpacaEx.Config.ws_url()
-
-    case WebSockex.start_link(ws_url, __MODULE__, state, handle_initial_conn_failure: true) do
-      {:ok, pid} ->
-        # Monitor the WebSocket process
-        Process.monitor(pid)
-        {:ok, pid}
-
-      error ->
-        error
-    end
-  end
-
-  defp handle_disconnect(state) do
     notify_callback(state, %{
       type: :connection,
       status: :disconnected,
       attempt: state.reconnect_attempt
     })
 
-    schedule_reconnect(state)
-    {:noreply, %{state | status: :disconnected, ws_pid: nil}}
+    backoff = calculate_backoff(state.reconnect_attempt)
+    new_state = %{state | status: :disconnected, reconnect_attempt: state.reconnect_attempt + 1}
+
+    {:reconnect, backoff, new_state}
   end
 
-  defp schedule_reconnect(state) do
-    backoff = calculate_backoff(state.reconnect_attempt)
-    Logger.info("Scheduling reconnect in #{backoff}ms")
-    Process.send_after(self(), :reconnect, backoff)
-    %{state | reconnect_attempt: state.reconnect_attempt + 1}
+  @impl true
+  def handle_ping(:ping, state) do
+    {:reply, :pong, state}
   end
+
+  @impl true
+  def handle_pong(:pong, state) do
+    {:ok, state}
+  end
+
+  # Private Functions
 
   defp calculate_backoff(attempt) do
     backoff = @initial_backoff * :math.pow(2, attempt) |> trunc()
@@ -333,7 +252,7 @@ defmodule AlpacaEx.Stream do
   defp process_message(%{"T" => "success", "msg" => "connected"}, state) do
     Logger.info("Connected to Alpaca stream")
     # Send authentication
-    send_auth(state.ws_pid)
+    send_auth(state)
     %{state | status: :connected}
   end
 
@@ -342,7 +261,7 @@ defmodule AlpacaEx.Stream do
 
     # Send pending subscriptions if any
     if has_subscriptions?(state.subscriptions) do
-      send_subscribe(state.ws_pid, state.subscriptions)
+      send_subscribe(state.subscriptions, state)
       %{state | status: :subscribed}
     else
       %{state | status: :authenticated}
@@ -443,17 +362,17 @@ defmodule AlpacaEx.Stream do
     state
   end
 
-  defp send_auth(ws_pid) do
+  defp send_auth(_state) do
     auth_msg = %{
       action: "auth",
       key: AlpacaEx.Config.api_key!(),
       secret: AlpacaEx.Config.api_secret!()
     }
 
-    send_json(ws_pid, auth_msg)
+    send_frame_async(auth_msg)
   end
 
-  defp send_subscribe(ws_pid, subscriptions) do
+  defp send_subscribe(subscriptions, _state) do
     # Filter out empty subscription lists
     filtered_subs =
       subscriptions
@@ -462,11 +381,11 @@ defmodule AlpacaEx.Stream do
 
     if filtered_subs != %{} do
       msg = Map.put(filtered_subs, :action, "subscribe")
-      send_json(ws_pid, msg)
+      send_frame_async(msg)
     end
   end
 
-  defp send_unsubscribe(ws_pid, subscriptions) do
+  defp send_unsubscribe(subscriptions, _state) do
     filtered_subs =
       subscriptions
       |> Enum.filter(fn {_key, values} -> values != [] end)
@@ -474,14 +393,14 @@ defmodule AlpacaEx.Stream do
 
     if filtered_subs != %{} do
       msg = Map.put(filtered_subs, :action, "unsubscribe")
-      send_json(ws_pid, msg)
+      send_frame_async(msg)
     end
   end
 
-  defp send_json(ws_pid, data) do
+  defp send_frame_async(data) do
     case Jason.encode(data) do
       {:ok, json} ->
-        WebSockex.send_frame(ws_pid, {:text, json})
+        WebSockex.cast(self(), {:send_frame, json})
 
       {:error, error} ->
         Logger.error("Failed to encode JSON: #{inspect(error)}")
@@ -544,31 +463,5 @@ defmodule AlpacaEx.Stream do
 
   defp parse_decimal(value) when is_number(value) do
     Decimal.from_float(value)
-  end
-
-  # WebSockex Callbacks
-
-  @impl WebSockex
-  def handle_frame({:text, msg}, state) do
-    send(self(), {:websocket, self(), {:text, msg}})
-    {:ok, state}
-  end
-
-  @impl WebSockex
-  def handle_frame(_frame, state) do
-    {:ok, state}
-  end
-
-  @impl WebSockex
-  def handle_disconnect(%{reason: reason}, state) do
-    Logger.warning("WebSocket disconnected: #{inspect(reason)}")
-    send(self(), {:websocket_disconnected, reason})
-    {:ok, state}
-  end
-
-  @impl WebSockex
-  def terminate(reason, _state) do
-    Logger.info("WebSocket terminating: #{inspect(reason)}")
-    :ok
   end
 end
